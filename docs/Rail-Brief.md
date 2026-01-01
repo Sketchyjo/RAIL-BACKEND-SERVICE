@@ -72,7 +72,7 @@ Rail operates as a rules-based capital engine with a permanent default allocatio
 
 Users can load money into Rail through two channels:
 
-* **Virtual Accounts**: Dedicated USD or GBP virtual accounts for bank transfers
+* **Virtual Accounts**: Dedicated USD virtual accounts via Grid for bank transfers
 * **Crypto On-Ramp**: USDC deposits from Ethereum, Polygon, BSC, or Solana
 
 Both methods trigger the same automatic split behavior.

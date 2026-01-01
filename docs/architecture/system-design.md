@@ -189,11 +189,12 @@ Rail is an automated wealth system that eliminates financial decision-making for
 | Service | Responsibility | External Dependencies |
 |---------|---------------|----------------------|
 | **Onboarding** | User registration, KYC, wallet provisioning | KYC Provider, Circle |
-| **Funding** | Virtual accounts (USD/GBP), multi-chain USDC deposits, 70/30 split | Circle, Due Network, Blockchain RPCs |
+| **Funding** | Multi-chain USDC deposits, 70/30 split | Circle, Grid, Blockchain RPCs |
 | **Spending** | Card transactions, round-ups, balance management | Card Issuer |
 | **Investing** | Auto-allocation, trade execution, portfolio | Alpaca |
 | **Wallet** | Multi-chain wallet management, custody | Circle |
 | **Conductor** | Copy trading, track management, trade mirroring | Alpaca |
+| **Grid** | Solana accounts, KYC, virtual accounts (USD), off-ramp | Grid API |
 
 ---
 
@@ -216,13 +217,13 @@ Rail is an automated wealth system that eliminates financial decision-making for
 │  ┌──────────────┐    ┌──────────────┐                  │                     │
 │  │   Virtual    │    │  Multi-Chain │                  │                     │
 │  │   Account    │    │    USDC      │                  │                     │
-│  │  (USD/GBP)   │    │   Deposit    │                  │                     │
+│  │    (USD)     │    │   Deposit    │                  │                     │
 │  └──────┬───────┘    └──────┬───────┘                  │                     │
 │         │                   │                          │                     │
 │         │ Bank Transfer     │ ETH/Polygon/BSC/Solana   │                     │
 │         ▼                   ▼                          │                     │
 │  ┌──────────────┐    ┌──────────────┐                  │                     │
-│  │ Due Network  │    │   Circle     │                  │                     │
+│  │    Grid      │    │   Circle     │                  │                     │
 │  │   Webhook    │    │   Webhook    │                  │                     │
 │  └──────┬───────┘    └──────┬───────┘                  │                     │
 │         │                   │                          │                     │
@@ -397,6 +398,74 @@ Rail is an automated wealth system that eliminates financial decision-making for
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### 5.5 Grid Integration Flow (Virtual Accounts & Off-Ramp)
+
+Grid provides Solana-based accounts with integrated KYC, virtual USD bank accounts, and off-ramp capabilities.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         GRID INTEGRATION FLOW                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  USER                                                                        │
+│    │                                                                         │
+│    │ 1. Initiate Grid Account                                                │
+│    ▼                                                                         │
+│  ┌──────────────┐                                                            │
+│  │    Grid      │  2. Send OTP to email                                      │
+│  │   Service    │─────────────────────────────────────────▶ Grid API         │
+│  └──────┬───────┘                                                            │
+│         │                                                                    │
+│         │ 3. User enters OTP                                                 │
+│         ▼                                                                    │
+│  ┌──────────────┐                                                            │
+│  │   Complete   │  4. Verify OTP + Create Solana Wallet                      │
+│  │   Account    │─────────────────────────────────────────▶ Grid API         │
+│  └──────┬───────┘                                                            │
+│         │                                                                    │
+│         │ 5. Store encrypted session secrets (AES-256-GCM)                   │
+│         ▼                                                                    │
+│  ┌──────────────┐                                                            │
+│  │  Initiate    │  6. Request KYC link                                       │
+│  │     KYC      │─────────────────────────────────────────▶ Grid API         │
+│  └──────┬───────┘                                                            │
+│         │                                                                    │
+│         │ 7. User completes KYC (external browser)                           │
+│         │ 8. KYC Webhook received                                            │
+│         ▼                                                                    │
+│  ┌──────────────┐                                                            │
+│  │   Setup      │  9. Request virtual account (requires KYC approved)        │
+│  │  Virtual     │─────────────────────────────────────────▶ Grid API         │
+│  │  Account     │                                                            │
+│  └──────┬───────┘                                                            │
+│         │                                                                    │
+│         │ 10. Virtual account created (USD bank details)                     │
+│         ▼                                                                    │
+│  ┌──────────────┐                                                            │
+│  │  Initiate    │  11. Create payment intent for off-ramp                    │
+│  │ Withdrawal   │─────────────────────────────────────────▶ Grid API         │
+│  └──────────────┘                                                            │
+│                                                                              │
+│  GRID ACCOUNT STATES: pending → active → suspended                           │
+│  GRID KYC STATES: none → pending → approved / rejected                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Grid Service Components:**
+
+| Component | Location | Description |
+|-----------|----------|-------------|
+| Grid Adapter | `internal/infrastructure/adapters/grid/` | HTTP client for Grid API |
+| Grid Service | `internal/domain/services/grid/` | Business logic layer |
+| Grid Repository | `internal/infrastructure/repositories/grid/` | PostgreSQL persistence |
+
+**Grid Database Tables:**
+
+| Table | Purpose |
+|-------|---------|
+| `grid_accounts` | User accounts with encrypted session secrets |
+| `grid_virtual_accounts` | Virtual USD bank accounts for on-ramp |
+| `grid_payment_intents` | Payment intents for off-ramp withdrawals |
 
 ---
 

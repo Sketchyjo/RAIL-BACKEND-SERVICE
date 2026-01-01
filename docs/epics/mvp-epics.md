@@ -53,11 +53,11 @@ This document outlines the MVP epics for Rail — an automated wealth system whe
 
 | ID | Feature | Priority | Description |
 |----|---------|----------|-------------|
-| 2.1 | Virtual Accounts (USD/GBP) | P0 | Dedicated virtual accounts for bank transfers |
+| 2.1 | Virtual Accounts (USD) | P0 | Dedicated virtual accounts via Grid for bank transfers |
 | 2.2 | Multi-Chain USDC Deposits | P0 | USDC deposits from Ethereum, Polygon, BSC, Solana |
 | 2.3 | Deposit Confirmation | P0 | Instant or near-instant confirmation |
 | 2.4 | Automatic Split Engine | P0 | 70/30 split on every deposit |
-| 2.5 | Deposit Webhooks | P0 | Real-time deposit detection from Due Network and Circle |
+| 2.5 | Deposit Webhooks | P0 | Real-time deposit detection from Grid and Circle |
 
 ### User Stories
 
@@ -71,7 +71,7 @@ This document outlines the MVP epics for Rail — an automated wealth system whe
 
 ### Acceptance Criteria
 - [ ] Deposit → split → system state update in < 60 seconds
-- [ ] Virtual accounts support USD and GBP currencies
+- [ ] Virtual accounts support USD currency via Grid
 - [ ] USDC accepted from Ethereum, Polygon, BSC, and Solana
 - [ ] 70% credited to Spend Balance
 - [ ] 30% credited to Invest Balance
@@ -261,7 +261,42 @@ This document outlines the MVP epics for Rail — an automated wealth system whe
 
 ---
 
-## Epic 9: Infrastructure & Non-Functional
+## Epic 9: Grid Integration (Virtual Accounts & Off-Ramp)
+
+**Goal**: Enable fiat on-ramp via virtual USD bank accounts and off-ramp via Grid's Solana-based infrastructure.
+
+### Features
+
+| ID | Feature | Priority | Description |
+|----|---------|----------|-------------|
+| 9.1 | Grid Account Creation | P0 | OTP-based account creation with Solana wallet |
+| 9.2 | Session Secret Management | P0 | Encrypted storage of Ed25519 keypairs |
+| 9.3 | Grid KYC Integration | P0 | KYC flow via Grid's external provider |
+| 9.4 | Virtual Account Setup | P0 | USD virtual bank account after KYC approval |
+| 9.5 | Off-Ramp via Payment Intent | P0 | Withdraw to external bank via payment intents |
+| 9.6 | KYC Webhook Processing | P0 | Handle Grid KYC status updates |
+
+### User Stories
+
+**US-9.1**: As a user, I can create a Grid account using my email so that I can access virtual banking features.
+
+**US-9.2**: As a user, I can complete KYC through Grid so that I can set up a virtual bank account.
+
+**US-9.3**: As a user, I can receive a USD virtual account after KYC approval so that I can fund via bank transfer.
+
+**US-9.4**: As a user, I can withdraw funds to my external bank account so that I can off-ramp to fiat.
+
+### Acceptance Criteria
+- [ ] Grid account creation via OTP verification
+- [ ] Session secrets encrypted at rest using AES-256-GCM
+- [ ] KYC status tracked (none → pending → approved/rejected)
+- [ ] Virtual account only available after KYC approval
+- [ ] Payment intents created for off-ramp withdrawals
+- [ ] KYC webhooks processed and status updated
+
+---
+
+## Epic 10: Infrastructure & Non-Functional
 
 **Goal**: Ensure reliability, security, and performance meet MVP standards.
 
