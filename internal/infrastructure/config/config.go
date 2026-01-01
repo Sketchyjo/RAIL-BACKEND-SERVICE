@@ -29,11 +29,18 @@ type Config struct {
 	Verification   VerificationConfig `mapstructure:"verification"`
 	Alpaca         AlpacaConfig         `mapstructure:"alpaca"`
 	Bridge         BridgeConfig         `mapstructure:"bridge"`
+	Grid           GridConfig           `mapstructure:"grid"`
 	Workers        WorkerConfig         `mapstructure:"workers"`
 	Reconciliation ReconciliationConfig `mapstructure:"reconciliation"`
 	SocialAuth     SocialAuthConfig     `mapstructure:"social_auth"`
 	WebAuthn       WebAuthnConfig       `mapstructure:"webauthn"`
 	AI             AIConfig             `mapstructure:"ai"`
+}
+
+// GridConfig contains Grid API configuration
+type GridConfig struct {
+	BaseURL string `mapstructure:"base_url"`
+	APIKey  string `mapstructure:"api_key"`
 }
 
 // AIConfig contains AI provider configuration

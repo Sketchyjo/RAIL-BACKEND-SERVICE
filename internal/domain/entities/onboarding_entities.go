@@ -81,7 +81,8 @@ type OnboardingStepType string
 
 const (
 	StepRegistration       OnboardingStepType = "registration"
-	StepEmailVerification  OnboardingStepType = "email_verification"
+	StepEmailVerification  OnboardingStepType = "email_verification"  // Deprecated: use StepOTPVerification
+	StepOTPVerification    OnboardingStepType = "otp_verification"    // Grid OTP verification
 	StepPhoneVerification  OnboardingStepType = "phone_verification"
 	StepPasscodeCreation   OnboardingStepType = "passcode_creation"
 	StepKYCSubmission      OnboardingStepType = "kyc_submission"
@@ -120,7 +121,8 @@ type UserProfile struct {
 	KYCRejectionReason *string          `json:"kyc_rejection_reason" db:"kyc_rejection_reason"`
 	DueAccountID       *string          `json:"due_account_id" db:"due_account_id"`
 	AlpacaAccountID    *string          `json:"alpaca_account_id" db:"alpaca_account_id"`
-	BridgeCustomerID    *string          `json:"bridge_customer_id" db:"bridge_customer_id"`
+	BridgeCustomerID   *string          `json:"bridge_customer_id" db:"bridge_customer_id"`
+	GridAccountID      *string          `json:"grid_account_id" db:"grid_account_id"` // Grid Solana account ID
 	IsActive           bool             `json:"is_active" db:"is_active"`
 	CreatedAt          time.Time        `json:"created_at" db:"created_at"`
 	UpdatedAt          time.Time        `json:"updated_at" db:"updated_at"`
@@ -413,10 +415,17 @@ type OnboardingCompleteRequest struct {
 // OnboardingCompleteResponse represents the response after completing onboarding
 type OnboardingCompleteResponse struct {
 	UserID          uuid.UUID `json:"userId"`
-	DueAccountID    string    `json:"dueAccountId"`
+	DueAccountID    string    `json:"dueAccountId,omitempty"`    // Deprecated: use GridAccountID
+	GridAccountID   string    `json:"gridAccountId,omitempty"`   // Grid Solana address
 	AlpacaAccountID string    `json:"alpacaAccountId"`
 	Message         string    `json:"message"`
 	NextSteps       []string  `json:"nextSteps"`
+}
+
+// KYCInitiationResponse represents the response from initiating Grid KYC
+type KYCInitiationResponse struct {
+	KYCURL    string    `json:"kycUrl"`
+	ExpiresAt time.Time `json:"expiresAt"`
 }
 
 // OnboardingProgressResponse represents the user's onboarding progress

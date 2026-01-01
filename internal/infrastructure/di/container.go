@@ -23,6 +23,7 @@ import (
 	"github.com/rail-service/rail_service/internal/domain/services/copytrading"
 	entitysecret "github.com/rail-service/rail_service/internal/domain/services/entity_secret"
 	"github.com/rail-service/rail_service/internal/domain/services/funding"
+	gridservice "github.com/rail-service/rail_service/internal/domain/services/grid"
 	"github.com/rail-service/rail_service/internal/domain/services/integration"
 	"github.com/rail-service/rail_service/internal/domain/services/investing"
 	"github.com/rail-service/rail_service/internal/domain/services/ledger"
@@ -44,11 +45,13 @@ import (
 	"github.com/rail-service/rail_service/internal/infrastructure/adapters"
 	"github.com/rail-service/rail_service/internal/infrastructure/adapters/alpaca"
 	"github.com/rail-service/rail_service/internal/infrastructure/adapters/bridge"
+	gridadapter "github.com/rail-service/rail_service/internal/infrastructure/adapters/grid"
 	"github.com/rail-service/rail_service/internal/infrastructure/ai"
 	"github.com/rail-service/rail_service/internal/infrastructure/cache"
 	"github.com/rail-service/rail_service/internal/infrastructure/circle"
 	"github.com/rail-service/rail_service/internal/infrastructure/config"
 	"github.com/rail-service/rail_service/internal/infrastructure/repositories"
+	gridrepo "github.com/rail-service/rail_service/internal/infrastructure/repositories/grid"
 	"github.com/rail-service/rail_service/pkg/auth"
 	commonmetrics "github.com/rail-service/rail_service/pkg/common/metrics"
 	"github.com/rail-service/rail_service/pkg/logger"
@@ -206,6 +209,7 @@ func mapChainToPaymentRail(chain string) bridge.PaymentRail {
 }
 
 // BridgeOnboardingAdapter adapts bridge.Adapter to onboarding.BridgeAdapter interface
+// Deprecated: Use GridOnboardingAdapter instead
 type BridgeOnboardingAdapter struct {
 	adapter *bridge.Adapter
 }
@@ -239,6 +243,63 @@ func (a *BridgeOnboardingAdapter) CreateCustomer(ctx context.Context, req *entit
 	return &entities.CreateAccountResponse{
 		AccountID: customer.Customer.ID,
 		Status:    string(customer.Customer.Status),
+	}, nil
+}
+
+// GridOnboardingAdapter adapts gridservice.Service to onboarding.GridService interface
+type GridOnboardingAdapter struct {
+	service *gridservice.Service
+}
+
+func (a *GridOnboardingAdapter) InitiateAccountCreation(ctx context.Context, userID uuid.UUID, email string) (*onboarding.GridAccountCreationStatus, error) {
+	result, err := a.service.InitiateAccountCreation(ctx, userID, email)
+	if err != nil {
+		return nil, err
+	}
+	return &onboarding.GridAccountCreationStatus{
+		Email:     result.Email,
+		OTPSent:   result.OTPSent,
+		ExpiresAt: result.ExpiresAt,
+	}, nil
+}
+
+func (a *GridOnboardingAdapter) CompleteAccountCreation(ctx context.Context, email, otp string) (*onboarding.GridAccountResult, error) {
+	result, err := a.service.CompleteAccountCreation(ctx, email, otp)
+	if err != nil {
+		return nil, err
+	}
+	return &onboarding.GridAccountResult{
+		ID:      result.ID,
+		Address: result.Address,
+		Email:   result.Email,
+		Status:  string(result.Status),
+	}, nil
+}
+
+func (a *GridOnboardingAdapter) GetAccount(ctx context.Context, userID uuid.UUID) (*entities.GridAccount, error) {
+	return a.service.GetAccount(ctx, userID)
+}
+
+func (a *GridOnboardingAdapter) InitiateKYC(ctx context.Context, userID uuid.UUID) (*onboarding.GridKYCInitiationResult, error) {
+	result, err := a.service.InitiateKYC(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	return &onboarding.GridKYCInitiationResult{
+		URL:       result.URL,
+		ExpiresAt: result.ExpiresAt,
+	}, nil
+}
+
+func (a *GridOnboardingAdapter) GetKYCStatus(ctx context.Context, userID uuid.UUID) (*onboarding.GridKYCStatusResult, error) {
+	result, err := a.service.GetKYCStatus(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	return &onboarding.GridKYCStatusResult{
+		Status:    result.Status,
+		UpdatedAt: result.UpdatedAt,
+		Reasons:   result.Reasons,
 	}, nil
 }
 
@@ -381,6 +442,11 @@ type Container struct {
 	// Round-up Services
 	RoundupRepo    *repositories.RoundupRepository
 	RoundupService *roundup.Service
+
+	// Grid Services
+	GridClient  *gridadapter.Client
+	GridRepo    *gridrepo.Repository
+	GridService *gridservice.Service
 
 	// Copy Trading Services
 	CopyTradingRepo    *repositories.CopyTradingRepository
@@ -646,25 +712,37 @@ func (c *Container) initializeDomainServices() error {
 	// Initialize Alpaca adapter
 	alpacaAdapter := alpaca.NewAdapter(c.AlpacaClient, c.Logger)
 
-	// Initialize Bridge onboarding adapter
-	bridgeOnboardingAdapter := &BridgeOnboardingAdapter{adapter: c.BridgeAdapter}
+	// Initialize Grid services
+	gridConfig := gridadapter.Config{
+		APIKey:  c.Config.Grid.APIKey,
+		BaseURL: c.Config.Grid.BaseURL,
+	}
+	c.GridClient = gridadapter.NewClient(gridConfig, c.ZapLog)
+	c.GridRepo = gridrepo.NewRepository(sqlx.NewDb(c.DB, "postgres"))
+	c.GridService = gridservice.NewService(
+		c.GridClient,
+		c.GridRepo,
+		c.Config.Security.EncryptionKey,
+		c.ZapLog,
+	)
 
-	// Initialize onboarding service (depends on wallet service)
+	// Create Grid service adapter for onboarding
+	gridOnboardingAdapter := &GridOnboardingAdapter{service: c.GridService}
+
+	// Initialize onboarding service (depends on wallet service and grid service)
 	// Note: AllocationService will be injected after it's initialized
 	c.OnboardingService = onboarding.NewService(
 		c.UserRepo,
 		c.OnboardingFlowRepo,
 		c.KYCSubmissionRepo,
 		c.WalletService, // Domain service dependency
-		c.KYCProvider,
+		gridOnboardingAdapter,
 		c.EmailService,
 		c.AuditService,
-		bridgeOnboardingAdapter,
 		alpacaAdapter,
 		nil, // AllocationService - will be set after initialization
 		c.ZapLog,
 		append([]entities.WalletChain(nil), walletServiceConfig.SupportedChains...),
-		c.Config.KYC.Provider, // KYC provider name
 	)
 
 	// Inject onboarding service back into wallet service to complete circular dependency

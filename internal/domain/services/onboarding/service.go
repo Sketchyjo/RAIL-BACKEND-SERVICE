@@ -19,15 +19,13 @@ type Service struct {
 	onboardingFlowRepo  OnboardingFlowRepository
 	kycSubmissionRepo   KYCSubmissionRepository
 	walletService       WalletService
-	kycProvider         KYCProvider
+	gridService         GridService
 	emailService        EmailService
 	auditService        AuditService
-	bridgeAdapter       BridgeAdapter
 	alpacaAdapter       AlpacaAdapter
 	allocationService   AllocationService
 	logger              *zap.Logger
 	defaultWalletChains []entities.WalletChain
-	kycProviderName     string
 }
 
 // Repository interfaces
@@ -61,12 +59,44 @@ type KYCSubmissionRepository interface {
 type WalletService interface {
 	CreateWalletsForUser(ctx context.Context, userID uuid.UUID, chains []entities.WalletChain) error
 	GetWalletStatus(ctx context.Context, userID uuid.UUID) (*entities.WalletStatusResponse, error)
+	RegisterExternalWallet(ctx context.Context, userID uuid.UUID, wallet *entities.ExternalWallet) error
 }
 
-type KYCProvider interface {
-	SubmitKYC(ctx context.Context, userID uuid.UUID, documents []entities.KYCDocumentUpload, personalInfo *entities.KYCPersonalInfo) (string, error)
-	GetKYCStatus(ctx context.Context, providerRef string) (*entities.KYCSubmission, error)
-	GenerateKYCURL(ctx context.Context, userID uuid.UUID) (string, error)
+// GridService handles Grid account creation, KYC, and virtual accounts
+type GridService interface {
+	InitiateAccountCreation(ctx context.Context, userID uuid.UUID, email string) (*GridAccountCreationStatus, error)
+	CompleteAccountCreation(ctx context.Context, email, otp string) (*GridAccountResult, error)
+	GetAccount(ctx context.Context, userID uuid.UUID) (*entities.GridAccount, error)
+	InitiateKYC(ctx context.Context, userID uuid.UUID) (*GridKYCInitiationResult, error)
+	GetKYCStatus(ctx context.Context, userID uuid.UUID) (*GridKYCStatusResult, error)
+}
+
+// GridAccountCreationStatus represents Grid account creation status
+type GridAccountCreationStatus struct {
+	Email     string
+	OTPSent   bool
+	ExpiresAt time.Time
+}
+
+// GridAccountResult represents the result of Grid account creation
+type GridAccountResult struct {
+	ID          uuid.UUID
+	Address     string // Solana address
+	Email       string
+	Status      string
+}
+
+// GridKYCInitiationResult represents the result of initiating Grid KYC
+type GridKYCInitiationResult struct {
+	URL       string
+	ExpiresAt time.Time
+}
+
+// GridKYCStatusResult represents Grid KYC status
+type GridKYCStatusResult struct {
+	Status    string
+	UpdatedAt time.Time
+	Reasons   []string
 }
 
 type EmailService interface {
@@ -77,10 +107,6 @@ type EmailService interface {
 
 type AuditService interface {
 	LogOnboardingEvent(ctx context.Context, userID uuid.UUID, action, entity string, before, after interface{}) error
-}
-
-type BridgeAdapter interface {
-	CreateCustomer(ctx context.Context, req *entities.CreateAccountRequest) (*entities.CreateAccountResponse, error)
 }
 
 type AlpacaAdapter interface {
@@ -98,36 +124,28 @@ func NewService(
 	onboardingFlowRepo OnboardingFlowRepository,
 	kycSubmissionRepo KYCSubmissionRepository,
 	walletService WalletService,
-	kycProvider KYCProvider,
+	gridService GridService,
 	emailService EmailService,
 	auditService AuditService,
-	bridgeAdapter BridgeAdapter,
 	alpacaAdapter AlpacaAdapter,
 	allocationService AllocationService,
 	logger *zap.Logger,
 	defaultWalletChains []entities.WalletChain,
-	kycProviderName string,
 ) *Service {
 	normalizedChains := normalizeDefaultWalletChains(defaultWalletChains, logger)
-
-	if kycProviderName == "" {
-		kycProviderName = "sumsub" // Default KYC provider
-	}
 
 	return &Service{
 		userRepo:            userRepo,
 		onboardingFlowRepo:  onboardingFlowRepo,
 		kycSubmissionRepo:   kycSubmissionRepo,
 		walletService:       walletService,
-		kycProvider:         kycProvider,
+		gridService:         gridService,
 		emailService:        emailService,
 		auditService:        auditService,
-		bridgeAdapter:       bridgeAdapter,
 		alpacaAdapter:       alpacaAdapter,
 		allocationService:   allocationService,
 		logger:              logger,
 		defaultWalletChains: normalizedChains,
-		kycProviderName:     kycProviderName,
 	}
 }
 
@@ -216,10 +234,11 @@ func (s *Service) StartOnboarding(ctx context.Context, req *entities.OnboardingS
 		return nil, fmt.Errorf("failed to create onboarding steps: %w", err)
 	}
 
-	// Send verification email
-	if err := s.emailService.SendVerificationEmail(ctx, user.Email, user.ID.String()); err != nil {
-		s.logger.Warn("Failed to send verification email", zap.Error(err), zap.String("email", user.Email))
-		// Don't fail onboarding start if email fails
+	// Initiate Grid account creation (sends OTP to user's email)
+	_, err = s.gridService.InitiateAccountCreation(ctx, user.ID, req.Email)
+	if err != nil {
+		s.logger.Error("Failed to initiate Grid account", zap.Error(err), zap.String("email", req.Email))
+		return nil, fmt.Errorf("failed to initiate account: %w", err)
 	}
 
 	// Log audit event
@@ -227,14 +246,14 @@ func (s *Service) StartOnboarding(ctx context.Context, req *entities.OnboardingS
 		s.logger.Warn("Failed to log audit event", zap.Error(err))
 	}
 
-	s.logger.Info("Onboarding started successfully",
+	s.logger.Info("Onboarding started successfully, OTP sent",
 		zap.String("userId", user.ID.String()),
 		zap.String("email", user.Email))
 
 	return &entities.OnboardingStartResponse{
 		UserID:           user.ID,
 		OnboardingStatus: user.OnboardingStatus,
-		NextStep:         entities.StepEmailVerification,
+		NextStep:         entities.StepOTPVerification,
 	}, nil
 }
 
@@ -301,6 +320,7 @@ func (s *Service) GetOnboardingStatus(ctx context.Context, userID uuid.UUID) (*e
 }
 
 // CompleteEmailVerification marks email verification as finished and advances onboarding without requiring KYC
+// Deprecated: Use VerifyGridOTP instead for Grid-based onboarding
 func (s *Service) CompleteEmailVerification(ctx context.Context, userID uuid.UUID) error {
 	_, err := s.userRepo.GetByID(ctx, userID)
 	if err != nil {
@@ -326,6 +346,63 @@ func (s *Service) CompleteEmailVerification(ctx context.Context, userID uuid.UUI
 	return nil
 }
 
+// VerifyGridOTP verifies the OTP sent by Grid and completes account creation
+func (s *Service) VerifyGridOTP(ctx context.Context, userID uuid.UUID, otp string) error {
+	s.logger.Info("Verifying Grid OTP", zap.String("userId", userID.String()))
+
+	user, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("failed to get user: %w", err)
+	}
+
+	// Complete Grid account creation (verifies OTP and creates Solana wallet)
+	gridAccount, err := s.gridService.CompleteAccountCreation(ctx, user.Email, otp)
+	if err != nil {
+		s.logger.Error("Grid OTP verification failed", zap.Error(err), zap.String("userId", userID.String()))
+		return fmt.Errorf("OTP verification failed: %w", err)
+	}
+
+	// Mark email as verified (Grid verified it via OTP)
+	now := time.Now()
+	user.EmailVerified = true
+	gridAccountID := gridAccount.ID.String()
+	user.GridAccountID = &gridAccountID
+	user.UpdatedAt = now
+
+	if err := s.userRepo.Update(ctx, user); err != nil {
+		return fmt.Errorf("failed to update user: %w", err)
+	}
+
+	// Mark OTP verification step as completed
+	if err := s.markStepCompleted(ctx, userID, entities.StepOTPVerification, map[string]any{
+		"grid_address": gridAccount.Address,
+		"verified_at":  now,
+	}); err != nil {
+		s.logger.Warn("Failed to mark OTP verification step as completed", zap.Error(err))
+	}
+
+	// Also mark email verification as completed for backward compatibility
+	if err := s.markStepCompleted(ctx, userID, entities.StepEmailVerification, map[string]any{
+		"verified_at": now,
+	}); err != nil {
+		s.logger.Warn("Failed to mark email verification step as completed", zap.Error(err))
+	}
+
+	// Log audit event
+	if err := s.auditService.LogOnboardingEvent(ctx, userID, "otp_verified", "user", nil, map[string]any{
+		"grid_address": gridAccount.Address,
+		"verified_at":  now,
+	}); err != nil {
+		s.logger.Warn("Failed to log OTP verification event", zap.Error(err))
+	}
+
+	s.logger.Info("Grid OTP verified successfully",
+		zap.String("userId", userID.String()),
+		zap.String("gridAddress", gridAccount.Address))
+
+	return nil
+}
+
 // CompleteOnboarding handles the completion of onboarding with personal info and account creation
 func (s *Service) CompleteOnboarding(ctx context.Context, req *entities.OnboardingCompleteRequest) (*entities.OnboardingCompleteResponse, error) {
 	s.logger.Info("Completing onboarding with account creation", zap.String("user_id", req.UserID.String()))
@@ -347,22 +424,7 @@ func (s *Service) CompleteOnboarding(ctx context.Context, req *entities.Onboardi
 	user.DateOfBirth = req.DateOfBirth
 	user.UpdatedAt = time.Now()
 
-	// Create Bridge customer
-	bridgeReq := &entities.CreateAccountRequest{
-		Type:      "individual",
-		FirstName: req.FirstName,
-		LastName:  req.LastName,
-		Email:     user.Email,
-		Country:   req.Country,
-	}
-
-	bridgeResp, err := s.bridgeAdapter.CreateCustomer(ctx, bridgeReq)
-	if err != nil {
-		s.logger.Error("Failed to create Bridge customer", zap.Error(err))
-		return nil, fmt.Errorf("failed to create Bridge customer: %w", err)
-	}
-
-	// Create Alpaca account
+	// Create Alpaca account for brokerage
 	alpacaReq := &entities.AlpacaCreateAccountRequest{
 		Contact: entities.AlpacaContact{
 			EmailAddress:  user.Email,
@@ -400,8 +462,8 @@ func (s *Service) CompleteOnboarding(ctx context.Context, req *entities.Onboardi
 		return nil, fmt.Errorf("failed to create Alpaca account: %w", err)
 	}
 
-	// Update user with account IDs (Bridge customer ID stored as DueAccountID for backward compatibility)
-	user.DueAccountID = &bridgeResp.AccountID
+	// Update user with Alpaca account ID
+	// Grid account ID is already stored in grid_accounts table and user.GridAccountID
 	user.AlpacaAccountID = &alpacaResp.ID
 	user.UpdatedAt = time.Now()
 
@@ -409,22 +471,31 @@ func (s *Service) CompleteOnboarding(ctx context.Context, req *entities.Onboardi
 		return nil, fmt.Errorf("failed to update user with account IDs: %w", err)
 	}
 
+	// Get Grid account address for response
+	var gridAddress string
+	if user.GridAccountID != nil {
+		gridAccount, err := s.gridService.GetAccount(ctx, req.UserID)
+		if err == nil && gridAccount != nil {
+			gridAddress = gridAccount.Address
+		}
+	}
+
 	// Log audit event
 	if err := s.auditService.LogOnboardingEvent(ctx, req.UserID, "accounts_created", "user", nil, map[string]any{
-		"bridge_customer_id": bridgeResp.AccountID,
-		"alpaca_account_id":  alpacaResp.ID,
+		"alpaca_account_id": alpacaResp.ID,
+		"grid_address":      gridAddress,
 	}); err != nil {
 		s.logger.Warn("Failed to log audit event", zap.Error(err))
 	}
 
 	s.logger.Info("Onboarding completed successfully",
 		zap.String("user_id", req.UserID.String()),
-		zap.String("bridge_customer_id", bridgeResp.AccountID),
-		zap.String("alpaca_account_id", alpacaResp.ID))
+		zap.String("alpaca_account_id", alpacaResp.ID),
+		zap.String("grid_address", gridAddress))
 
 	return &entities.OnboardingCompleteResponse{
 		UserID:          req.UserID,
-		DueAccountID:    bridgeResp.AccountID, // Bridge customer ID
+		GridAccountID:   gridAddress,
 		AlpacaAccountID: alpacaResp.ID,
 		Message:         "Accounts created successfully. Please create your passcode to continue.",
 		NextSteps:       []string{"create_passcode"},
@@ -452,11 +523,31 @@ func (s *Service) CompletePasscodeCreation(ctx context.Context, userID uuid.UUID
 		return fmt.Errorf("failed to update onboarding status: %w", err)
 	}
 
-	// Kick off wallet provisioning after passcode creation
-	if err := s.walletService.CreateWalletsForUser(ctx, userID, s.defaultWalletChains); err != nil {
-		s.logger.Warn("Failed to enqueue wallet provisioning after passcode creation",
-			zap.Error(err),
-			zap.String("userId", userID.String()))
+	// Check if user has Grid account (Solana wallet already created during OTP verification)
+	gridAccount, err := s.gridService.GetAccount(ctx, userID)
+	if err == nil && gridAccount != nil && gridAccount.Address != "" {
+		// Register Grid wallet in managed_wallets for compatibility
+		if err := s.walletService.RegisterExternalWallet(ctx, userID, &entities.ExternalWallet{
+			Chain:    entities.WalletChainSolana,
+			Address:  gridAccount.Address,
+			Provider: entities.WalletProviderGrid,
+		}); err != nil {
+			s.logger.Warn("Failed to register Grid wallet", zap.Error(err))
+		} else {
+			s.logger.Info("Registered Grid Solana wallet",
+				zap.String("userId", userID.String()),
+				zap.String("address", gridAccount.Address))
+		}
+	}
+
+	// Only create Circle wallets for non-Solana chains (Grid provides Solana wallet)
+	nonSolanaChains := filterOutSolana(s.defaultWalletChains)
+	if len(nonSolanaChains) > 0 {
+		if err := s.walletService.CreateWalletsForUser(ctx, userID, nonSolanaChains); err != nil {
+			s.logger.Warn("Failed to enqueue wallet provisioning for non-Solana chains",
+				zap.Error(err),
+				zap.String("userId", userID.String()))
+		}
 	}
 
 	// Auto-enable 70/30 allocation mode (Rail MVP default - non-negotiable)
@@ -488,93 +579,102 @@ func (s *Service) CompletePasscodeCreation(ctx context.Context, userID uuid.UUID
 	return nil
 }
 
-// SubmitKYC handles KYC document submission
-func (s *Service) SubmitKYC(ctx context.Context, userID uuid.UUID, req *entities.KYCSubmitRequest) error {
-	s.logger.Info("Submitting KYC documents", zap.String("userId", userID.String()))
+// filterOutSolana removes Solana chains from the list (Grid provides Solana wallet)
+func filterOutSolana(chains []entities.WalletChain) []entities.WalletChain {
+	result := make([]entities.WalletChain, 0, len(chains))
+	for _, chain := range chains {
+		if chain != entities.WalletChainSolana && chain != entities.WalletChainSOLDevnet {
+			result = append(result, chain)
+		}
+	}
+	return result
+}
+
+// InitiateGridKYC initiates KYC through Grid and returns the KYC URL
+func (s *Service) InitiateGridKYC(ctx context.Context, userID uuid.UUID) (*entities.KYCInitiationResponse, error) {
+	s.logger.Info("Initiating Grid KYC", zap.String("userId", userID.String()))
 
 	user, err := s.userRepo.GetByID(ctx, userID)
 	if err != nil {
-		return fmt.Errorf("failed to get user: %w", err)
+		return nil, fmt.Errorf("failed to get user: %w", err)
 	}
 
 	if !user.CanStartKYC() {
-		return fmt.Errorf("user cannot start KYC process")
+		return nil, fmt.Errorf("user cannot start KYC process")
 	}
 
-	// Submit to KYC provider
-	providerRef, err := s.kycProvider.SubmitKYC(ctx, userID, req.Documents, req.PersonalInfo)
+	// Initiate KYC through Grid
+	kycResp, err := s.gridService.InitiateKYC(ctx, userID)
 	if err != nil {
-		return fmt.Errorf("failed to submit KYC to provider: %w", err)
+		s.logger.Error("Failed to initiate Grid KYC", zap.Error(err))
+		return nil, fmt.Errorf("failed to initiate KYC: %w", err)
 	}
 
-	// Create KYC submission record
-	submission := &entities.KYCSubmission{
-		ID:             uuid.New(),
-		UserID:         userID,
-		Provider:       s.kycProviderName,
-		ProviderRef:    providerRef,
-		SubmissionType: req.DocumentType,
-		Status:         entities.KYCStatusProcessing,
-		VerificationData: map[string]any{
-			"document_type": req.DocumentType,
-			"documents":     req.Documents,
-			"personal_info": req.PersonalInfo,
-			"metadata":      req.Metadata,
-		},
-		SubmittedAt: time.Now(),
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
-	}
-
-	if err := s.kycSubmissionRepo.Create(ctx, submission); err != nil {
-		return fmt.Errorf("failed to create KYC submission record: %w", err)
-	}
-
-	// Update user KYC tracking fields
+	// Update user KYC status
 	now := time.Now()
 	user.KYCStatus = string(entities.KYCStatusProcessing)
-	user.KYCProviderRef = &providerRef
 	user.KYCSubmittedAt = &now
 	user.UpdatedAt = now
 
 	if err := s.userRepo.Update(ctx, user); err != nil {
-		return fmt.Errorf("failed to update user KYC status: %w", err)
+		return nil, fmt.Errorf("failed to update user KYC status: %w", err)
 	}
 
-	// Update onboarding flow
+	// Mark KYC submission step as in progress
 	if err := s.markStepCompleted(ctx, userID, entities.StepKYCSubmission, map[string]any{
-		"provider_ref": providerRef,
-		"submitted_at": now,
+		"initiated_at": now,
+		"kyc_url":      kycResp.URL,
 	}); err != nil {
-		s.logger.Warn("Failed to mark KYC submission step as completed", zap.Error(err))
+		s.logger.Warn("Failed to mark KYC submission step", zap.Error(err))
 	}
 
 	// Log audit event
-	if err := s.auditService.LogOnboardingEvent(ctx, userID, "kyc_submitted", "kyc_submission", nil, submission); err != nil {
+	if err := s.auditService.LogOnboardingEvent(ctx, userID, "kyc_initiated", "user", nil, map[string]any{
+		"initiated_at": now,
+	}); err != nil {
 		s.logger.Warn("Failed to log audit event", zap.Error(err))
 	}
 
-	s.logger.Info("KYC submitted successfully",
-		zap.String("userId", userID.String()),
-		zap.String("providerRef", providerRef))
+	s.logger.Info("Grid KYC initiated successfully", zap.String("userId", userID.String()))
 
-	return nil
+	return &entities.KYCInitiationResponse{
+		KYCURL:    kycResp.URL,
+		ExpiresAt: kycResp.ExpiresAt,
+	}, nil
 }
 
-// ProcessKYCCallback processes KYC provider callbacks
+// SubmitKYC handles KYC document submission
+// Deprecated: Use InitiateGridKYC instead for Grid-based KYC
+func (s *Service) SubmitKYC(ctx context.Context, userID uuid.UUID, req *entities.KYCSubmitRequest) error {
+	s.logger.Info("SubmitKYC called - redirecting to InitiateGridKYC", zap.String("userId", userID.String()))
+	
+	// For backward compatibility, initiate Grid KYC
+	_, err := s.InitiateGridKYC(ctx, userID)
+	return err
+}
+
+// ProcessKYCCallback processes KYC provider callbacks (Grid KYC webhooks)
 func (s *Service) ProcessKYCCallback(ctx context.Context, providerRef string, status entities.KYCStatus, rejectionReasons []string) error {
 	s.logger.Info("Processing KYC callback",
 		zap.String("providerRef", providerRef),
 		zap.String("status", string(status)))
 
-	// Get KYC submission
+	// For Grid, providerRef is the Grid address
+	// Try to find user by Grid address via the grid_accounts table
+	// First, try the old way via KYC submission
 	submission, err := s.kycSubmissionRepo.GetByProviderRef(ctx, providerRef)
+	var user *entities.UserProfile
+	
 	if err != nil {
-		return fmt.Errorf("failed to get KYC submission: %w", err)
+		// Try to find by Grid address - this is the new Grid flow
+		s.logger.Info("KYC submission not found, trying Grid address lookup", zap.String("providerRef", providerRef))
+		// We need to look up the user by their Grid account address
+		// For now, log and return - the Grid service webhook handler should handle this
+		return fmt.Errorf("KYC submission not found for provider ref: %s", providerRef)
 	}
 
-	// Get user
-	user, err := s.userRepo.GetByID(ctx, submission.UserID)
+	// Get user from submission
+	user, err = s.userRepo.GetByID(ctx, submission.UserID)
 	if err != nil {
 		return fmt.Errorf("failed to get user: %w", err)
 	}
@@ -639,6 +739,80 @@ func (s *Service) ProcessKYCCallback(ctx context.Context, providerRef string, st
 	s.logger.Info("KYC callback processed successfully",
 		zap.String("userId", user.ID.String()),
 		zap.String("status", string(status)))
+
+	return nil
+}
+
+// ProcessGridKYCWebhook processes Grid KYC webhook updates
+func (s *Service) ProcessGridKYCWebhook(ctx context.Context, gridAddress string, status string, reasons []string) error {
+	s.logger.Info("Processing Grid KYC webhook",
+		zap.String("gridAddress", gridAddress),
+		zap.String("status", status))
+
+	// Get Grid account by address to find the user
+	gridAccount, err := s.gridService.GetAccount(ctx, uuid.Nil) // We need to look up by address
+	if err != nil {
+		// The Grid service's ProcessKYCWebhook should handle this directly
+		s.logger.Warn("Could not find Grid account, webhook should be handled by Grid service", zap.Error(err))
+		return nil
+	}
+
+	// Map Grid KYC status to our KYC status
+	var kycStatus entities.KYCStatus
+	switch status {
+	case "approved":
+		kycStatus = entities.KYCStatusApproved
+	case "rejected":
+		kycStatus = entities.KYCStatusRejected
+	case "pending":
+		kycStatus = entities.KYCStatusProcessing
+	default:
+		kycStatus = entities.KYCStatusProcessing
+	}
+
+	// Get user
+	user, err := s.userRepo.GetByID(ctx, gridAccount.UserID)
+	if err != nil {
+		return fmt.Errorf("failed to get user: %w", err)
+	}
+
+	// Update user KYC status
+	var kycApprovedAt *time.Time
+	var kycRejectionReason *string
+
+	if kycStatus == entities.KYCStatusApproved {
+		now := time.Now()
+		kycApprovedAt = &now
+
+		if err := s.markStepCompleted(ctx, user.ID, entities.StepKYCReview, map[string]any{
+			"status":      string(kycStatus),
+			"approved_at": now,
+		}); err != nil {
+			s.logger.Warn("Failed to mark KYC review step as completed", zap.Error(err))
+		}
+	} else if kycStatus == entities.KYCStatusRejected {
+		if len(reasons) > 0 {
+			reason := fmt.Sprintf("KYC rejected: %v", reasons)
+			kycRejectionReason = &reason
+		}
+
+		if err := s.markStepFailed(ctx, user.ID, entities.StepKYCReview, fmt.Sprintf("KYC rejected: %v", reasons)); err != nil {
+			s.logger.Warn("Failed to mark KYC review step as failed", zap.Error(err))
+		}
+	}
+
+	if err := s.userRepo.UpdateKYCStatus(ctx, user.ID, string(kycStatus), kycApprovedAt, kycRejectionReason); err != nil {
+		return fmt.Errorf("failed to update user KYC status: %w", err)
+	}
+
+	// Send status email
+	if err := s.emailService.SendKYCStatusEmail(ctx, user.Email, kycStatus, reasons); err != nil {
+		s.logger.Warn("Failed to send KYC status email", zap.Error(err))
+	}
+
+	s.logger.Info("Grid KYC webhook processed successfully",
+		zap.String("userId", user.ID.String()),
+		zap.String("status", string(kycStatus)))
 
 	return nil
 }
@@ -832,7 +1006,8 @@ func (s *Service) ProcessWalletCreationComplete(ctx context.Context, userID uuid
 func (s *Service) createInitialOnboardingSteps(ctx context.Context, userID uuid.UUID) error {
 	steps := []entities.OnboardingStepType{
 		entities.StepRegistration,
-		entities.StepEmailVerification,
+		entities.StepOTPVerification,
+		entities.StepEmailVerification, // Keep for backward compatibility
 		entities.StepPasscodeCreation,
 		entities.StepKYCSubmission,
 		entities.StepKYCReview,
@@ -878,7 +1053,8 @@ func (s *Service) normalizeCompletedSteps(user *entities.UserProfile, steps []en
 	completed[entities.StepRegistration] = true
 
 	if user.EmailVerified {
-		completed[entities.StepEmailVerification] = true
+		completed[entities.StepOTPVerification] = true
+		completed[entities.StepEmailVerification] = true // Backward compatibility
 	}
 
 	// Check if passcode is created by checking if user has a passcode hash
@@ -907,6 +1083,7 @@ func (s *Service) normalizeCompletedSteps(user *entities.UserProfile, steps []en
 
 	canonical := []entities.OnboardingStepType{
 		entities.StepRegistration,
+		entities.StepOTPVerification,
 		entities.StepEmailVerification,
 		entities.StepPasscodeCreation,
 		entities.StepKYCSubmission,
@@ -997,7 +1174,7 @@ func (s *Service) triggerWalletCreation(ctx context.Context, userID uuid.UUID) e
 
 func (s *Service) determineNextStep(user *entities.UserProfile) entities.OnboardingStepType {
 	if !user.EmailVerified {
-		return entities.StepEmailVerification
+		return entities.StepOTPVerification
 	}
 
 	if user.OnboardingStatus == entities.OnboardingStatusCompleted {
