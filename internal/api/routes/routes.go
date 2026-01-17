@@ -286,6 +286,7 @@ func SetupRoutes(container *di.Container) *gin.Engine {
 					container.StationService,
 					container.GetAllocationService(),
 					container.GetInvestingService(),
+					container.GetCardService(),
 					*container.UserRepo,
 					container.ZapLog,
 				)
