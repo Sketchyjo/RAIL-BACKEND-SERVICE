@@ -12,6 +12,7 @@ import (
 
 	"github.com/rail-service/rail_service/internal/domain/entities"
 	"github.com/rail-service/rail_service/internal/domain/services/allocation"
+	"github.com/rail-service/rail_service/internal/domain/services/card"
 	"github.com/rail-service/rail_service/internal/domain/services/investing"
 	"github.com/rail-service/rail_service/internal/domain/services/station"
 	"github.com/rail-service/rail_service/internal/infrastructure/repositories"
@@ -22,6 +23,7 @@ type MobileHandlers struct {
 	stationService    *station.Service
 	allocationService *allocation.Service
 	investingService  *investing.Service
+	cardService       *card.Service
 	userRepo          repositories.UserRepository
 	cardRepo          CardRepository
 	logger            *zap.Logger
@@ -37,6 +39,7 @@ func NewMobileHandlers(
 	stationService *station.Service,
 	allocationService *allocation.Service,
 	investingService *investing.Service,
+	cardService *card.Service,
 	userRepo repositories.UserRepository,
 	cardRepo CardRepository,
 	logger *zap.Logger,
@@ -45,6 +48,7 @@ func NewMobileHandlers(
 		stationService:    stationService,
 		allocationService: allocationService,
 		investingService:  investingService,
+		cardService:       cardService,
 		userRepo:          userRepo,
 		cardRepo:          cardRepo,
 		logger:            logger,
@@ -108,6 +112,12 @@ func (h *MobileHandlers) GetMobileHome(c *gin.Context) {
 	// Get user for KYC status
 	user, _ := h.userRepo.GetUserEntityByID(ctx, userID)
 	kycVerified := user != nil && user.KYCStatus == "approved"
+
+	// Check if user has any cards
+	hasCard := false
+	if cards, err := h.cardService.GetUserCards(ctx, userID); err == nil && len(cards) > 0 {
+		hasCard = true
+	}
 
 	// Determine system status
 	systemStatus := "active"
